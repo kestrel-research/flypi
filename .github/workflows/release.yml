@@ -1,0 +1,85 @@
+# Publishes flypi when you push a version tag, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+#
+# Uses PyPI trusted publishing (no API tokens). It must match the pending
+# publishers configured on PyPI and TestPyPI:
+#   owner: kestrel-research   repo: flypi   workflow: release.yml
+#   environments: testpypi (TestPyPI) and pypi (PyPI)
+#
+# Flow: build -> TestPyPI -> (your approval on the `pypi` environment) -> PyPI.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches the package version
+        run: |
+          version=$(python -c "import re;print(re.search(r'\"(.+?)\"', open('src/flypi/_version.py').read()).group(1))")
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package version ${version} (src/flypi/_version.py)"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: |
+          pip install -e ".[dev]"
+          pytest -q
+
+      - name: Build and check
+        run: |
+          python -m build
+          twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/flypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/flypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

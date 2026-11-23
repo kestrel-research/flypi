@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flypi"
+dynamic = ["version"]
+description = "Fly ArduPilot and PX4 drones from a Raspberry Pi with a few lines of Python."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Kestrel Research contributors" }]
+keywords = [
+    "drone",
+    "uav",
+    "mavlink",
+    "ardupilot",
+    "px4",
+    "raspberry-pi",
+    "companion-computer",
+    "autonomy",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Hardware",
+    "Typing :: Typed",
+]
+dependencies = ["pymavlink>=2.4.40"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "build>=1.2", "twine>=5"]
+
+[project.urls]
+Homepage = "https://github.com/kestrel-research/flypi"
+Source = "https://github.com/kestrel-research/flypi"
+Issues = "https://github.com/kestrel-research/flypi/issues"
+Changelog = "https://github.com/kestrel-research/flypi/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/flypi/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flypi"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/flypi",
+    "tests",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
