@@ -51,5 +51,22 @@ class ModeError(FlypiError, ValueError):
     """The requested flight mode does not exist for this vehicle."""
 
 
+class FlightInterrupted(FlypiError):
+    """Something other than your script took over while flypi was waiting.
+
+    Raised when, for example, the vehicle disarms during takeoff, or switches
+    out of ``LAND`` before touching down. Usual causes: a failsafe (battery,
+    radio, geofence, EKF), the RC pilot changing mode, or another ground
+    station. The message includes the vehicle's recent STATUSTEXT messages.
+
+    Attributes:
+        mode: The flight mode the vehicle was in when flypi noticed.
+    """
+
+    def __init__(self, message: str, mode: str | None = None):
+        self.mode = mode
+        super().__init__(message)
+
+
 class NotArmedError(FlypiError):
     """An action needs the vehicle to be armed, but it is disarmed."""

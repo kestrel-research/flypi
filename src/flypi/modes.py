@@ -7,6 +7,8 @@ hide that difference so flypi can work with plain mode names such as
 
 from __future__ import annotations
 
+from typing import Any
+
 from pymavlink import mavutil
 
 mavlink = mavutil.mavlink
@@ -37,9 +39,9 @@ def system_status_name(status: int) -> str:
     return _enum_name("MAV_STATE", status, "MAV_STATE_")
 
 
-def mode_from_heartbeat(heartbeat) -> str:
+def mode_from_heartbeat(heartbeat: Any) -> str:
     """Decode the current flight mode name from a HEARTBEAT message."""
-    return mavutil.mode_string_v10(heartbeat)
+    return str(mavutil.mode_string_v10(heartbeat))
 
 
 def available_modes(autopilot: int, mav_type: int) -> list[str]:
@@ -70,5 +72,5 @@ def _enum_name(enum: str, value: int, prefix: str) -> str:
     entry = mavlink.enums.get(enum, {}).get(value)
     if entry is None:
         return f"{enum}({value})"
-    name = entry.name
+    name = str(entry.name)
     return name[len(prefix) :] if name.startswith(prefix) else name

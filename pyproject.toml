@@ -42,7 +42,7 @@ classifiers = [
 dependencies = ["pymavlink>=2.4.40"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "build>=1.2", "twine>=5"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "build>=1.2", "twine>=5"]
 
 [project.urls]
 Homepage = "https://github.com/kestrel-research/flypi"
@@ -69,6 +69,16 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/flypi"]
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["pymavlink", "pymavlink.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
