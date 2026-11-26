@@ -22,7 +22,7 @@ with flypi.connect("udp:127.0.0.1:14550") as drone:
     drone.land()  # waits until landed and disarmed
 ```
 
-> **Status: alpha (v0.1).** The API may still change before 1.0.
+> **Status: alpha (v0.1.1).** The API may still change before 1.0.
 > ArduPilot Copter is the primary target. PX4 support is experimental.
 
 ## Install
@@ -52,6 +52,24 @@ flypi waits for the autopilot's heartbeat. It ignores heartbeats from ground
 stations, gimbals and cameras. If nothing is heard within `timeout`, you get a
 `flypi.ConnectionTimeout` that tells you what to check.
 
+## Why flypi
+
+- **Every command is confirmed.** flypi waits for the autopilot's `COMMAND_ACK`,
+  retries when an ACK is lost, never resends a command the vehicle reports as
+  `IN_PROGRESS`, and backs off on `TEMPORARILY_REJECTED`. A command that silently
+  did nothing is a classic cause of crashes; with flypi it is always an exception.
+- **Errors tell you why.** A refused arm includes the autopilot's own `PreArm:`
+  reasons, even when they arrive after the refusal (ArduPilot often sends them a
+  moment later).
+- **No hanging.** If heartbeats stop, any wait or command raises
+  `flypi.ConnectionLost` within `heartbeat_timeout` seconds (5 s by default).
+- **Takeovers are noticed.** If a failsafe, the RC pilot or another ground station
+  changes mode during `takeoff()` or `land()`, you get `flypi.FlightInterrupted`
+  at once, not a timeout minutes later.
+- **Light and easy to adopt.** Fully typed (checked with `mypy --strict`),
+  thread-safe immutable telemetry snapshots, one dependency (pymavlink), and
+  Apache-2.0 licensed. It fits on a Raspberry Pi and through a legal review.
+
 ## What you can do in v0.1
 
 | Call | What it does |
@@ -75,7 +93,27 @@ flypi.errors.CommandRejected: MAV_CMD_COMPONENT_ARM_DISARM was rejected by the
 vehicle (MAV_RESULT_FAILED). Recent vehicle messages: PreArm: Need 3D Fix
 ```
 
-All errors inherit from `flypi.FlypiError`.
+All errors inherit from `flypi.FlypiError`:
+
+| Error | Meaning |
+|---|---|
+| `ConnectionTimeout` | No autopilot heartbeat while connecting |
+| `ConnectionLost` | Heartbeats stopped while flypi was waiting on the vehicle |
+| `CommandRejected` | The autopilot refused a command (`.result`, `.status_messages`) |
+| `CommandTimeout` | The autopilot never acknowledged a command, even after retries |
+| `FlightInterrupted` | A failsafe, the pilot or another GCS took over mid-manoeuvre (`.mode`) |
+| `WaitTimeout` | A condition was not reached in time |
+| `ModeError` | That mode name does not exist on this vehicle |
+| `NotArmedError` | The action needs the vehicle to be armed |
+
+```python
+try:
+    drone.takeoff(10)
+except flypi.FlightInterrupted as e:
+    print(f"Something else took over (now in {e.mode}): {e}")
+except flypi.ConnectionLost:
+    print("Link lost; the autopilot's own failsafe is now in charge")
+```
 
 ### Telemetry example
 
@@ -88,6 +126,28 @@ print(f"GPS fix {t.gps.fix_type}, {t.gps.satellites} satellites")
 ```
 
 Values the vehicle has not reported yet are `None`.
+
+## Coming from DroneKit
+
+DroneKit-Python fails to import on Python 3.10 and newer (it uses
+`collections.MutableMapping`, which Python 3.10 removed), and current Raspberry Pi
+OS releases ship newer Pythons than that. flypi is a small, typed replacement for
+the most common DroneKit flight scripts:
+
+| DroneKit | flypi |
+|---|---|
+| `connect(addr, wait_ready=True)` | `flypi.connect(addr)`, then `drone.wait_ready()` |
+| `vehicle.mode = VehicleMode("GUIDED")` + polling | `drone.set_mode("GUIDED")` (confirmed) |
+| `vehicle.armed = True` + `while not vehicle.armed` | `drone.arm()` (confirmed, with `PreArm:` reasons on failure) |
+| `vehicle.is_armable` | `drone.is_armable` |
+| `vehicle.simple_takeoff(alt)` + altitude loop | `drone.takeoff(alt)` (waits until it gets there) |
+| `vehicle.location.global_relative_frame.alt` | `drone.telemetry.position.alt_rel` |
+| `vehicle.battery`, `vehicle.gps_0` | `drone.telemetry.battery`, `drone.telemetry.gps` |
+| `vehicle.attitude` (radians) | `drone.telemetry.attitude` (**degrees**) |
+| `add_attribute_listener` / polling loops | `drone.wait_until(condition, timeout)` |
+| `vehicle.close()` | `drone.close()` or `with flypi.connect(...) as drone:` |
+
+Not in flypi yet: `simple_goto`, missions and parameters (see the roadmap).
 
 ## Try it in simulation first
 
@@ -115,6 +175,11 @@ message from the vehicle to keep telemetry current, and sends a 1 Hz
 ground-station heartbeat so the autopilot knows a controller is attached. Your
 code calls ordinary blocking methods. No `asyncio` is needed.
 
+flypi asks the vehicle for the telemetry streams it needs and confirms each
+request. Streams the vehicle refused or did not confirm are listed in
+`drone.unconfirmed_streams` (and logged); flypi keeps working with whatever the
+vehicle sends by default.
+
 Because flypi heartbeats as a ground station, an autopilot with a GCS failsafe
 enabled (`FS_GCS_ENABLE` on ArduPilot) will treat your script stopping
 mid-flight as a lost ground station and run its failsafe action. That is
@@ -135,6 +200,7 @@ cd flypi
 pip install -e ".[dev]"
 pytest
 ruff check .
+mypy
 ```
 
 The test suite runs flypi end to end over real UDP sockets against a small

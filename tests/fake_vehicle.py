@@ -48,6 +48,14 @@ class FakeVehicle(threading.Thread):
         rate_hz: float = 25.0,
         climb_rate: float = 10.0,
         descent_rate: float = 8.0,
+        drop_acks: dict[int, int] | None = None,
+        temp_rejects: dict[int, int] | None = None,
+        in_progress: dict[int, float] | None = None,
+        late_prearm: bool = False,
+        gimbal_acks: bool = False,
+        no_interval_ack: bool = False,
+        refuse_interval: bool = False,
+        ack_delay: float = 0.0,
     ) -> None:
         super().__init__(daemon=True)
         self.port = port
@@ -59,6 +67,19 @@ class FakeVehicle(threading.Thread):
         self.period = 1.0 / rate_hz
         self.climb_rate = climb_rate
         self.descent_rate = descent_rate
+        # Misbehaviour knobs, keyed by MAV_CMD id:
+        self.drop_acks = dict(drop_acks or {})  # swallow the first N ACKs
+        self.temp_rejects = dict(temp_rejects or {})  # answer TEMPORARILY_REJECTED N times
+        self.in_progress = dict(in_progress or {})  # IN_PROGRESS for N s (inf = forever)
+        self.late_prearm = late_prearm  # send FAILED before the PreArm text, like ArduPilot
+        self.gimbal_acks = gimbal_acks  # a gimbal ACKs every command with FAILED first
+        self.no_interval_ack = no_interval_ack
+        self.refuse_interval = refuse_interval
+        self.ack_delay = ack_delay  # send each ACK this many seconds late
+        self._delayed_acks: list[tuple[float, int, int]] = []
+        self.confirmations: list[tuple[int, int]] = []
+        self._pending: list[tuple[float, int, int]] = []  # (finish_at, command, result)
+        self._delayed_text: list[tuple[float, str]] = []
 
         self.armed = False
         self.custom_mode = px4_custom_mode(PX4_POSCTL) if self.px4 else APM_MODES["STABILIZE"]
@@ -92,6 +113,7 @@ class FakeVehicle(threading.Thread):
             try:
                 self._send_telemetry()
                 self._read_incoming()
+                self._service_pending()
             except OSError:
                 if self._halt.is_set():
                     break
@@ -110,6 +132,30 @@ class FakeVehicle(threading.Thread):
 
     def statustext(self, text: str) -> None:
         self.conn.mav.statustext_send(mavlink.MAV_SEVERITY_CRITICAL, text.encode())
+
+    def _ack(self, command: int, result: int) -> None:
+        if self.ack_delay:
+            self._delayed_acks.append((time.monotonic() + self.ack_delay, command, result))
+        else:
+            self.conn.mav.command_ack_send(command, result)
+
+    def _service_pending(self) -> None:
+        now = time.monotonic()
+        for item in list(self._pending):
+            finish_at, command, result = item
+            if now >= finish_at:
+                self._pending.remove(item)
+                self._ack(command, result)
+            else:
+                self._ack(command, mavlink.MAV_RESULT_IN_PROGRESS)
+        for item in list(self._delayed_acks):
+            if now >= item[0]:
+                self._delayed_acks.remove(item)
+                self.conn.mav.command_ack_send(item[1], item[2])
+        for item in list(self._delayed_text):
+            if now >= item[0]:
+                self._delayed_text.remove(item)
+                self.statustext(item[1])
 
     def _physics(self, dt: float) -> None:
         if not self.armed:
@@ -171,16 +217,39 @@ class FakeVehicle(threading.Thread):
             if mtype == "HEARTBEAT" and msg.type == mavlink.MAV_TYPE_GCS:
                 self.gcs_heartbeats_received += 1
             elif mtype == "COMMAND_LONG" and msg.target_system == 1:
-                self.commands_received.append(msg.command)
-                result = self._handle_command(msg)
-                if self.ack_commands:
-                    self.conn.mav.command_ack_send(msg.command, result)
+                self._on_command(msg)
+
+    def _on_command(self, msg) -> None:
+        cmd = msg.command
+        self.commands_received.append(cmd)
+        self.confirmations.append((cmd, msg.confirmation))
+        if self.gimbal_acks:
+            self._gimbal.command_ack_send(cmd, mavlink.MAV_RESULT_FAILED)
+        if cmd == mavlink.MAV_CMD_SET_MESSAGE_INTERVAL and self.no_interval_ack:
+            return
+        if self.drop_acks.get(cmd, 0) > 0:
+            self.drop_acks[cmd] -= 1
+            return
+        if self.temp_rejects.get(cmd, 0) > 0:
+            self.temp_rejects[cmd] -= 1
+            self._ack(cmd, mavlink.MAV_RESULT_TEMPORARILY_REJECTED)
+            return
+        if cmd in self.in_progress:
+            if any(p[1] == cmd for p in self._pending):
+                return  # already running: a resend must not restart it
+            result = self._handle_command(msg)
+            self._ack(cmd, mavlink.MAV_RESULT_IN_PROGRESS)
+            self._pending.append((time.monotonic() + self.in_progress[cmd], cmd, result))
+            return
+        result = self._handle_command(msg)
+        if self.ack_commands:
+            self._ack(cmd, result)
 
     def _handle_command(self, msg) -> int:
         cmd = msg.command
         ok, failed = mavlink.MAV_RESULT_ACCEPTED, mavlink.MAV_RESULT_FAILED
         if cmd == mavlink.MAV_CMD_SET_MESSAGE_INTERVAL:
-            return ok
+            return mavlink.MAV_RESULT_UNSUPPORTED if self.refuse_interval else ok
         if cmd == mavlink.MAV_CMD_DO_SET_MODE:
             if self.px4:
                 self.custom_mode = px4_custom_mode(int(msg.param2), int(msg.param3))
@@ -193,7 +262,11 @@ class FakeVehicle(threading.Thread):
             forced = int(msg.param2) == 21196
             if msg.param1 == 1:
                 if not forced and not self.prearm_ok:
-                    self.statustext("PreArm: Battery below minimum arming voltage")
+                    text = "PreArm: Battery below minimum arming voltage"
+                    if self.late_prearm:
+                        self._delayed_text.append((time.monotonic() + 0.2, text))
+                    else:
+                        self.statustext(text)
                     return failed
                 if not forced and self.gps_fix < 3:
                     self.statustext("PreArm: Need 3D Fix")

@@ -30,6 +30,7 @@ from .errors import (
     CommandTimeout,
     ConnectionLost,
     ConnectionTimeout,
+    FlightInterrupted,
     FlypiError,
     ModeError,
     NotArmedError,
@@ -46,7 +47,19 @@ DEFAULT_ADDRESS = "udp:127.0.0.1:14550"
 _FORCE_MAGIC = 21196  # MAV_CMD_COMPONENT_ARM_DISARM param2 that bypasses checks
 _HEARTBEAT_PERIOD = 1.0
 _STATUS_WINDOW = 10.0  # seconds of STATUSTEXT history attached to errors
+_ARMING_WINDOW = 60.0  # how far back to look for PreArm:/Arm: reasons on a refused arm
+_REJECT_GRACE = 0.5  # max seconds to wait for the vehicle to explain a rejection
+_REJECT_QUIET = 0.15  # ...but stop once its messages have been quiet this long
+_TEMP_REJECT_BACKOFF = 0.5  # seconds between retries of a TEMPORARILY_REJECTED command
+_PROGRESS_TIMEOUT = 60.0  # hard cap on a command that keeps answering IN_PROGRESS
+_STATUSTEXT_LEN = 50  # MAVLink STATUSTEXT chunk size
 _UINT16_MAX = 65535
+_ARMING_PREFIXES = ("PreArm:", "Arm:")
+# Modes a vehicle may legitimately pass through while landing / returning home.
+_TAKEOFF_MODES = frozenset({"GUIDED", "TAKEOFF"})  # ArduPilot; Plane may use TAKEOFF
+_LAND_MODES = frozenset({"LAND", "QLAND"})
+_RTL_MODES = frozenset({"RTL", "LAND", "QRTL", "QLAND", "SMART_RTL"})
+_TEMPORARILY_REJECTED = object()  # sentinel returned by Drone._await_ack
 
 # Messages flypi asks the vehicle to stream, with their rates in Hz.
 _STREAM_RATES = {
@@ -87,6 +100,8 @@ def connect(
         source_component: MAVLink component ID flypi uses for itself.
         send_heartbeat: Send a 1 Hz ground-station heartbeat to the vehicle.
         request_streams: Ask the vehicle to stream the telemetry flypi uses.
+            Each request is confirmed; any the vehicle refuses are listed in
+            :attr:`Drone.unconfirmed_streams`.
         heartbeat_timeout: Seconds without a vehicle heartbeat before waits
             raise :class:`~flypi.ConnectionLost`.
 
@@ -157,14 +172,25 @@ class Drone:
         self._sensors_present: int | None = None
         self._sensors_health: int | None = None
         self._acks: dict[int, Any] = {}
-        self._status_messages: deque[tuple[float, str]] = deque(maxlen=50)
+        self._command_locks: dict[int, threading.Lock] = {}
+        self._status_messages: deque[tuple[float, str]] = deque(maxlen=100)
+        self._statustext_chunks: dict[int, list[str]] = {}
+        self._thread_error: BaseException | None = None
+        self._source_system: int = getattr(link, "source_system", 0) or 0
+        self._source_component: int = getattr(link, "source_component", 0) or 0
+        self.unconfirmed_streams: list[str] = []
+        """Telemetry stream requests the vehicle did not confirm (see :func:`connect`)."""
 
         self._handle_heartbeat(heartbeat)
 
         self._thread = threading.Thread(target=self._run, name="flypi-link", daemon=True)
         self._thread.start()
         if request_streams:
-            self._request_streams()
+            try:
+                self._request_streams()
+            except BaseException:
+                self.close()  # do not leave the link thread running behind a failed connect
+                raise
 
     # ------------------------------------------------------------------ info
 
@@ -340,10 +366,13 @@ class Drone:
 
         if wait:
             reached = altitude - max(0.3, 0.05 * altitude)
+            # ArduPilot must stay in GUIDED; leaving it means a failsafe or the pilot
+            # took over. PX4 moves through TAKEOFF to HOLD by itself, so only arming
+            # is checked there.
+            hold_modes = None if self._autopilot_id == mavlink.MAV_AUTOPILOT_PX4 else _TAKEOFF_MODES
 
             def at_altitude() -> bool:
-                if not self._armed:
-                    raise FlypiError("The vehicle disarmed during takeoff.")
+                self._check_flight("takeoff", hold_modes)
                 alt = self._position.get("alt_rel")
                 return alt is not None and alt >= reached
 
@@ -355,10 +384,18 @@ class Drone:
         Args:
             wait: Block until the vehicle has landed and disarmed.
             timeout: Seconds to wait when ``wait`` is ``True``.
+
+        Raises:
+            FlightInterrupted: if the vehicle leaves ``LAND`` mode before it
+                has disarmed (for example the RC pilot took control).
         """
         self.set_mode("LAND")
         if wait:
-            self._wait(lambda: not self._armed, timeout, "landing (vehicle to disarm)")
+            self._wait(
+                lambda: self._landed_or_check("landing", _LAND_MODES),
+                timeout,
+                "landing (vehicle to disarm)",
+            )
 
     def return_to_launch(self, *, wait: bool = False, timeout: float = 300.0) -> None:
         """Fly back to the home position and land (RTL mode).
@@ -366,10 +403,18 @@ class Drone:
         Args:
             wait: Block until the vehicle has landed and disarmed.
             timeout: Seconds to wait when ``wait`` is ``True``.
+
+        Raises:
+            FlightInterrupted: (only with ``wait=True``) if the vehicle leaves
+                RTL before it has disarmed.
         """
         self.set_mode("RTL")
         if wait:
-            self._wait(lambda: not self._armed, timeout, "return to launch (vehicle to disarm)")
+            self._wait(
+                lambda: self._landed_or_check("return to launch", _RTL_MODES),
+                timeout,
+                "return to launch (vehicle to disarm)",
+            )
 
     def wait_until(
         self,
@@ -421,6 +466,15 @@ class Drone:
 
     def _run(self) -> None:
         """Background thread: read messages and send heartbeats."""
+        try:
+            self._loop()
+        except BaseException as exc:  # pragma: no cover - defensive
+            log.critical("flypi link thread crashed", exc_info=True)
+            with self._cond:
+                self._thread_error = exc
+                self._cond.notify_all()
+
+    def _loop(self) -> None:
         next_heartbeat = 0.0
         while not self._closed:
             try:
@@ -430,40 +484,62 @@ class Drone:
                     next_heartbeat = now + _HEARTBEAT_PERIOD
                 msg = self._link.recv_match(blocking=True, timeout=0.1)
             except Exception:
-                if self._closed:
-                    break
+                if self._closed:  # close() ran on another thread mid-read
+                    break  # type: ignore[unreachable]
                 log.warning("MAVLink link error; retrying", exc_info=True)
                 time.sleep(0.2)
                 continue
-            if msg is not None:
-                with self._cond:
+            if msg is None:
+                continue
+            with self._cond:
+                try:
                     self._handle(msg)
-                    self._cond.notify_all()
+                except Exception:
+                    # One malformed message must never stop telemetry or heartbeats.
+                    log.warning("ignoring a %s message flypi could not parse", msg, exc_info=True)
+                self._cond.notify_all()
 
     def _send(self, fn: Callable[[Any], None]) -> None:
-        with self._send_lock:
-            fn(self._link.mav)
+        try:
+            with self._send_lock:
+                fn(self._link.mav)
+        except OSError as exc:
+            raise ConnectionLost(f"Could not send to the vehicle: {exc}") from exc
 
     def _request_streams(self) -> None:
+        """Ask for telemetry streams, confirming each request with the vehicle.
+
+        A vehicle refusing a stream is not fatal (flypi still works on whatever
+        the vehicle sends by default), so failures are logged and recorded in
+        :attr:`unconfirmed_streams` instead of raised.
+        """
         ts, tc = self.target_system, self.target_component
         for msg_id, hz in _STREAM_RATES.items():
-            self._send(
-                lambda mav, msg_id=msg_id, hz=hz: mav.command_long_send(
-                    ts,
-                    tc,
+            msg_name = mavlink.mavlink_map[msg_id].msgname
+            try:
+                self._command_long(
                     mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                    0,
-                    msg_id,
-                    1_000_000 / hz,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
+                    (msg_id, 1_000_000 / hz),
+                    timeout=1.0,
+                    retries=1,
+                    explain=False,
                 )
-            )
+            except CommandRejected as exc:
+                self.unconfirmed_streams.append(msg_name)
+                log.warning("vehicle refused to stream %s at %g Hz (%s)", msg_name, hz, exc.result)
+            except CommandTimeout:
+                # This vehicle does not answer SET_MESSAGE_INTERVAL at all, so do not
+                # spend seconds per stream finding that out again.
+                remaining = [mavlink.mavlink_map[m].msgname for m in _STREAM_RATES]
+                self.unconfirmed_streams.extend(remaining[remaining.index(msg_name) :])
+                log.warning(
+                    "vehicle does not acknowledge MAV_CMD_SET_MESSAGE_INTERVAL; "
+                    "relying on its default telemetry streams"
+                )
+                break
         if self._autopilot_id == mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA:
             # Older ArduPilot firmware only understands the legacy stream request.
+            # REQUEST_DATA_STREAM is a message, not a command: MAVLink has no ACK for it.
             self._send(
                 lambda mav: mav.request_data_stream_send(ts, tc, mavlink.MAV_DATA_STREAM_ALL, 4, 1)
             )
@@ -475,39 +551,167 @@ class Drone:
         *,
         timeout: float = 3.0,
         retries: int = 2,
+        explain: bool = True,
     ) -> Any:
-        """Send COMMAND_LONG and wait for an ACCEPTED COMMAND_ACK."""
+        """Send COMMAND_LONG and wait until the vehicle ACKs it as ACCEPTED.
+
+        * No ACK within ``timeout``: resend (with MAVLink's ``confirmation``
+          counter incremented), up to ``retries`` times.
+        * ``IN_PROGRESS``: the vehicle is working on it. flypi never resends a
+          command that is in progress; it waits for the final ACK, up to a
+          hard cap (60 s).
+        * ``TEMPORARILY_REJECTED``: back off and retry, like a missing ACK.
+        * Any other result: raise :class:`CommandRejected`, after giving the
+          vehicle a moment to send the STATUSTEXT that explains why.
+        """
         name = _enum_name("MAV_CMD", command)
         padded = tuple(params) + (0,) * (7 - len(params))
         ts, tc = self.target_system, self.target_component
-        for attempt in range(retries + 1):
-            with self._cond:
-                self._acks.pop(command, None)
-            self._send(
-                lambda mav, attempt=attempt: mav.command_long_send(
-                    ts, tc, command, attempt, *padded
-                )
+        with self._cond:
+            lock = self._command_locks.setdefault(command, threading.Lock())
+        # Two threads sending the same command would each see the other's ACK.
+        with lock:
+            sent_at = time.monotonic()
+            for attempt in range(retries + 1):
+                with self._cond:
+                    self._acks.pop(command, None)
+                confirmation = min(attempt, 255)
+
+                def send(mav: Any, confirmation: int = confirmation) -> None:
+                    mav.command_long_send(ts, tc, command, confirmation, *padded)
+
+                self._send(send)
+                outcome = self._await_ack(command, name, timeout, sent_at, explain)
+                if outcome is not None and outcome is not _TEMPORARILY_REJECTED:
+                    return outcome
+                if attempt < retries:
+                    log.debug("no usable ACK for %s (attempt %d); retrying", name, attempt + 1)
+            if outcome is _TEMPORARILY_REJECTED:
+                with self._cond:
+                    raise self._rejection(
+                        command, name, mavlink.MAV_RESULT_TEMPORARILY_REJECTED, sent_at, explain
+                    )
+            raise CommandTimeout(
+                f"{name} was not acknowledged after {retries + 1} attempts "
+                f"({timeout:g}s each). The vehicle is sending heartbeats but not answering "
+                "commands: check the link is two-way (serial TX wired, UDP return path "
+                "reachable) and that no other program is reading this connection."
             )
-            deadline = time.monotonic() + timeout
-            with self._cond:
-                while True:
-                    self._check_alive()
-                    ack = self._acks.pop(command, None)
-                    if ack is not None:
-                        if ack.result == mavlink.MAV_RESULT_ACCEPTED:
-                            return ack
-                        if ack.result == mavlink.MAV_RESULT_IN_PROGRESS:
-                            deadline = time.monotonic() + timeout
-                            continue
-                        raise CommandRejected(
-                            name, _enum_name("MAV_RESULT", ack.result), self._recent_status()
+
+    def _await_ack(
+        self, command: int, name: str, timeout: float, sent_at: float, explain: bool
+    ) -> Any:
+        """Wait for one attempt's ACK.
+
+        Returns the ACCEPTED ACK, ``None`` if no ACK arrived, or
+        ``_TEMPORARILY_REJECTED``; both of the latter mean "retry".
+        Raises for a definite rejection, or a command stuck IN_PROGRESS.
+        """
+        deadline = time.monotonic() + timeout
+        progress_cap: float | None = None
+        with self._cond:
+            while True:
+                self._check_alive()
+                ack = self._acks.pop(command, None)
+                if ack is not None:
+                    result = ack.result
+                    if result == mavlink.MAV_RESULT_ACCEPTED:
+                        return ack
+                    if result == mavlink.MAV_RESULT_IN_PROGRESS:
+                        now = time.monotonic()
+                        if progress_cap is None:
+                            progress_cap = now + max(_PROGRESS_TIMEOUT, timeout)
+                            log.debug("%s is in progress", name)
+                        # MAVLink does not promise regular progress updates, so after the
+                        # first IN_PROGRESS keep waiting for the final ACK, up to the cap.
+                        deadline = progress_cap
+                        continue
+                    if result == mavlink.MAV_RESULT_TEMPORARILY_REJECTED:
+                        self._cond.wait(_TEMP_REJECT_BACKOFF)
+                        return _TEMPORARILY_REJECTED
+                    raise self._rejection(command, name, result, sent_at, explain)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if progress_cap is not None:
+                        # Resending a command the vehicle is already executing could
+                        # restart it (e.g. a calibration), so this is final.
+                        raise CommandTimeout(
+                            self._explain(
+                                f"{name} was accepted as IN_PROGRESS but the vehicle never "
+                                "reported that it finished"
+                            )
                         )
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self._cond.wait(min(remaining, 0.2))
-            log.debug("no ACK for %s (attempt %d)", name, attempt + 1)
-        raise CommandTimeout(f"{name} was not acknowledged after {retries + 1} attempts")
+                    return None
+                self._cond.wait(min(remaining, 0.2))
+
+    def _rejection(
+        self, command: int, name: str, result: int, sent_at: float, explain: bool
+    ) -> CommandRejected:
+        """Build a CommandRejected, waiting briefly for the vehicle's explanation.
+
+        Autopilots often send the ACK first and the reason a moment later
+        (ArduPilot queues STATUSTEXT, so ``PreArm: ...`` can trail the FAILED ACK).
+        """
+        result_name = _enum_name("MAV_RESULT", result)
+        if not explain:
+            return CommandRejected(name, result_name)
+        rejected_at = time.monotonic()
+        deadline = rejected_at + _REJECT_GRACE
+        while True:
+            now = time.monotonic()
+            last = self._status_messages[-1][0] if self._status_messages else 0.0
+            if last >= rejected_at and now - last >= _REJECT_QUIET:
+                break  # the vehicle explained itself and has gone quiet
+            if now >= deadline:
+                break
+            self._cond.wait(min(deadline - now, 0.05))
+
+        messages = [text for t, text in self._status_messages if t >= sent_at]
+        if not messages:
+            messages = self._recent_status()
+        if command == mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+            cutoff = time.monotonic() - _ARMING_WINDOW
+            reasons = [
+                text
+                for t, text in self._status_messages
+                if t >= cutoff and text.startswith(_ARMING_PREFIXES) and text not in messages
+            ]
+            messages = _dedupe(messages + reasons)
+        return CommandRejected(name, result_name, messages)
+
+    def _check_flight(self, phase: str, hold_modes: frozenset[str] | None) -> None:
+        """Raise FlightInterrupted if the vehicle disarmed or left ``hold_modes``."""
+        if not self._armed:
+            raise FlightInterrupted(
+                self._explain(f"The vehicle disarmed during {phase}"), mode=self._mode
+            )
+        if hold_modes is not None and self._mode not in hold_modes:
+            raise FlightInterrupted(
+                self._explain(
+                    f"{phase.capitalize()} interrupted: the vehicle switched from GUIDED "
+                    f"to {self._mode} (a failsafe, the RC pilot or another ground station)"
+                ),
+                mode=self._mode,
+            )
+
+    def _landed_or_check(self, phase: str, allowed_modes: frozenset[str]) -> bool:
+        if not self._armed:
+            return True
+        if self._mode not in allowed_modes:
+            raise FlightInterrupted(
+                self._explain(
+                    f"{phase.capitalize()} interrupted: the vehicle switched to {self._mode} "
+                    "before landing (a failsafe, the RC pilot or another ground station)"
+                ),
+                mode=self._mode,
+            )
+        return False
+
+    def _explain(self, message: str) -> str:
+        recent = self._recent_status()
+        if recent:
+            message += ". Recent vehicle messages: " + " | ".join(recent)
+        return message
 
     def _wait(self, predicate: Callable[[], bool], timeout: float, description: str) -> Telemetry:
         deadline = time.monotonic() + timeout
@@ -518,19 +722,27 @@ class Drone:
                     return self._snapshot()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    message = f"Timed out after {timeout:g}s waiting for {description}"
-                    recent = self._recent_status()
-                    if recent:
-                        message += ". Recent vehicle messages: " + " | ".join(recent)
-                    raise WaitTimeout(message)
+                    raise WaitTimeout(
+                        self._explain(f"Timed out after {timeout:g}s waiting for {description}")
+                    )
                 self._cond.wait(min(remaining, 0.2))
 
     def _check_alive(self) -> None:
         if self._closed:
             raise FlypiError("This Drone connection is closed.")
+        if self._thread_error is not None:
+            raise ConnectionLost(
+                f"flypi's link thread stopped unexpectedly ({self._thread_error!r}); "
+                "telemetry and heartbeats are no longer flowing."
+            ) from self._thread_error
         age = self._heartbeat_age()
         if age > self.heartbeat_timeout:
-            raise ConnectionLost(f"No heartbeat from the vehicle for {age:.1f}s.")
+            raise ConnectionLost(
+                self._explain(
+                    f"No heartbeat from the vehicle for {age:.1f}s "
+                    f"(heartbeat_timeout={self.heartbeat_timeout:g}s)"
+                )
+            )
 
     def _heartbeat_age(self) -> float:
         return time.monotonic() - self._last_heartbeat
@@ -612,11 +824,40 @@ class Drone:
                 hdop=None if msg.eph == _UINT16_MAX else msg.eph / 100.0,
             )
         elif mtype == "STATUSTEXT":
-            text = msg.text.rstrip("\x00").strip() if isinstance(msg.text, str) else str(msg.text)
-            self._status_messages.append((time.monotonic(), text))
-            log.info("vehicle: %s", text)
-        elif mtype == "COMMAND_ACK":
+            self._handle_statustext(msg)
+        elif mtype == "COMMAND_ACK" and self._ack_is_for_us(msg):
             self._acks[msg.command] = msg
+
+    def _ack_is_for_us(self, msg: Any) -> bool:
+        # Only the autopilot component answers our commands; a gimbal or camera on
+        # the same system may ACK the same command ID for its own reasons.
+        if msg.get_srcComponent() != self.target_component:
+            return False
+        # MAVLink 2 ACKs name their recipient. 0 means "not set" (always so on MAVLink 1).
+        ack_sys = getattr(msg, "target_system", 0) or 0
+        ack_comp = getattr(msg, "target_component", 0) or 0
+        if ack_sys and self._source_system and ack_sys != self._source_system:
+            return False  # an answer to another ground station
+        return not (ack_comp and self._source_component and ack_comp != self._source_component)
+
+    def _handle_statustext(self, msg: Any) -> None:
+        raw = msg.text if isinstance(msg.text, str) else str(msg.text)
+        raw = raw.rstrip("\x00")
+        text_id = getattr(msg, "id", 0) or 0
+        if text_id:
+            # MAVLink 2 splits long texts into 50-char chunks sharing one id.
+            chunks = self._statustext_chunks.setdefault(text_id, [])
+            chunks.append(raw)
+            if len(raw) >= _STATUSTEXT_LEN and len(chunks) < 8:
+                if len(self._statustext_chunks) > 16:  # drop abandoned partial texts
+                    self._statustext_chunks.pop(next(iter(self._statustext_chunks)))
+                return
+            raw = "".join(self._statustext_chunks.pop(text_id))
+        text = raw.strip()
+        if not text:
+            return
+        self._status_messages.append((time.monotonic(), text))
+        log.info("vehicle: %s", text)
 
     def _handle_heartbeat(self, msg: Any) -> None:
         self._last_heartbeat = time.monotonic()
@@ -632,7 +873,7 @@ def _send_gcs_heartbeat(mav: Any) -> None:
 
 
 def _is_vehicle_heartbeat(msg: Any) -> bool:
-    return msg.autopilot != mavlink.MAV_AUTOPILOT_INVALID and msg.type != mavlink.MAV_TYPE_GCS
+    return bool(msg.autopilot != mavlink.MAV_AUTOPILOT_INVALID and msg.type != mavlink.MAV_TYPE_GCS)
 
 
 def _wait_for_vehicle(
@@ -662,6 +903,10 @@ def _wait_for_vehicle(
             continue
         if target_system is None or msg.get_srcSystem() == target_system:
             return msg
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
 
 
 def _enum_name(enum: str, value: int) -> str:
