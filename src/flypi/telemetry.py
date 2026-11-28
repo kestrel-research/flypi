@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ._geo import distance_m
+
 
 @dataclass(frozen=True)
 class Position:
@@ -27,6 +29,19 @@ class Position:
     alt_msl: float | None = None
     alt_rel: float | None = None
     heading: float | None = None
+
+    def distance_to(self, lat: float, lon: float) -> float | None:
+        """Horizontal distance in metres from this position to ``lat``, ``lon``.
+
+        Returns ``None`` if this position has no ``lat``/``lon`` yet.
+
+        Example:
+            >>> drone.telemetry.position.distance_to(-35.3629, 149.1655)  # doctest: +SKIP
+            12.4
+        """
+        if self.lat is None or self.lon is None:
+            return None
+        return distance_m(self.lat, self.lon, lat, lon)
 
 
 @dataclass(frozen=True)
