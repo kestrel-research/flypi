@@ -170,6 +170,7 @@ the most common DroneKit flight scripts:
 | `vehicle.simple_takeoff(alt)` + altitude loop | `drone.takeoff(alt)` (waits until it gets there) |
 | `vehicle.simple_goto(LocationGlobalRelative(lat, lon, alt))` + distance loop | `drone.goto(lat, lon, alt)` (confirmed, waits until it gets there) |
 | `simple_goto(..., groundspeed=5)` | `drone.goto(..., groundspeed=5)` |
+| `get_distance_metres(a, b)` helper | `drone.telemetry.position.distance_to(lat, lon)` |
 | `get_location_metres(...)` helper + `simple_goto` | `drone.goto_relative(north=..., east=...)` |
 | `vehicle.location.global_relative_frame.alt` | `drone.telemetry.position.alt_rel` |
 | `vehicle.battery`, `vehicle.gps_0` | `drone.telemetry.battery`, `drone.telemetry.gps` |
