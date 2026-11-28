@@ -70,7 +70,7 @@ stations, gimbals and cameras. If nothing is heard within `timeout`, you get a
   thread-safe immutable telemetry snapshots, one dependency (pymavlink), and
   Apache-2.0 licensed. It fits on a Raspberry Pi and through a legal review.
 
-## What you can do in v0.1
+## What you can do in v0.2
 
 | Call | What it does |
 |---|---|
@@ -79,6 +79,8 @@ stations, gimbals and cameras. If nothing is heard within `timeout`, you get a
 | `drone.set_mode("LOITER")` | Change flight mode and confirm it |
 | `drone.arm()` / `drone.disarm()` | Arm or disarm and confirm it |
 | `drone.takeoff(altitude)` | Vertical takeoff to `altitude` metres above home |
+| `drone.goto(lat, lon, altitude)` | Fly to a position (confirmed with the autopilot), wait until there |
+| `drone.goto_relative(north=, east=, up=)` | Fly a distance in metres from where the vehicle is |
 | `drone.land()` | Land at the current position, wait for disarm |
 | `drone.return_to_launch()` | Switch to RTL |
 | `drone.wait_until(cond, timeout)` | Wait for any telemetry condition |
@@ -127,6 +129,31 @@ print(f"GPS fix {t.gps.fix_type}, {t.gps.satellites} satellites")
 
 Values the vehicle has not reported yet are `None`.
 
+### Going somewhere
+
+```python
+drone.takeoff(10)
+drone.goto(-35.36290, 149.16550, 15)  # lat, lon, metres above home
+drone.goto_relative(north=20, east=-10)  # 20 m north, 10 m west
+drone.goto(-35.36326, 149.16523, groundspeed=3)  # slower; altitude unchanged
+```
+
+`goto()` blocks until the vehicle is within `tolerance` metres (default 1 m) of
+the target. Pass `wait=False` to return straight away.
+
+MAVLink has no acknowledgement for position targets, so most libraries just
+send one and hope. flypi confirms it:
+
+* **ArduPilot**: flypi switches to `GUIDED`, sends the target, then asks the
+  autopilot to report the target it is flying to. A lost target is resent; one
+  the autopilot ignored raises `CommandRejected` (result `NOT_APPLIED`) within a
+  few seconds, instead of the script waiting out its timeout.
+* **PX4** (experimental): flypi uses `MAV_CMD_DO_REPOSITION`, which PX4
+  acknowledges, and the vehicle flies it in Hold (`LOITER`).
+
+If a failsafe, the RC pilot or another ground station changes mode on the way,
+`goto()` raises `FlightInterrupted`.
+
 ## Coming from DroneKit
 
 DroneKit-Python fails to import on Python 3.10 and newer (it uses
@@ -141,13 +168,16 @@ the most common DroneKit flight scripts:
 | `vehicle.armed = True` + `while not vehicle.armed` | `drone.arm()` (confirmed, with `PreArm:` reasons on failure) |
 | `vehicle.is_armable` | `drone.is_armable` |
 | `vehicle.simple_takeoff(alt)` + altitude loop | `drone.takeoff(alt)` (waits until it gets there) |
+| `vehicle.simple_goto(LocationGlobalRelative(lat, lon, alt))` + distance loop | `drone.goto(lat, lon, alt)` (confirmed, waits until it gets there) |
+| `simple_goto(..., groundspeed=5)` | `drone.goto(..., groundspeed=5)` |
+| `get_location_metres(...)` helper + `simple_goto` | `drone.goto_relative(north=..., east=...)` |
 | `vehicle.location.global_relative_frame.alt` | `drone.telemetry.position.alt_rel` |
 | `vehicle.battery`, `vehicle.gps_0` | `drone.telemetry.battery`, `drone.telemetry.gps` |
 | `vehicle.attitude` (radians) | `drone.telemetry.attitude` (**degrees**) |
 | `add_attribute_listener` / polling loops | `drone.wait_until(condition, timeout)` |
 | `vehicle.close()` | `drone.close()` or `with flypi.connect(...) as drone:` |
 
-Not in flypi yet: `simple_goto`, missions and parameters (see the roadmap).
+Not in flypi yet: velocity control, missions and parameters (see the roadmap).
 
 ## Try it in simulation first
 
@@ -208,7 +238,7 @@ MAVLink vehicle emulator (`tests/fake_vehicle.py`), so it needs no simulator.
 
 ## Roadmap
 
-- `goto(lat, lon, alt)` and velocity control in GUIDED/OFFBOARD
+- Velocity control in GUIDED/OFFBOARD
 - Missions: upload, start, monitor
 - Parameters: read and write
 - Camera capture helpers for the Raspberry Pi camera

@@ -59,7 +59,28 @@ _ARMING_PREFIXES = ("PreArm:", "Arm:")
 _TAKEOFF_MODES = frozenset({"GUIDED", "TAKEOFF"})  # ArduPilot; Plane may use TAKEOFF
 _LAND_MODES = frozenset({"LAND", "QLAND"})
 _RTL_MODES = frozenset({"RTL", "LAND", "QRTL", "QLAND", "SMART_RTL"})
+_PX4_GOTO_MODES = frozenset({"LOITER"})  # PX4 flies DO_REPOSITION in Hold (AUTO.LOITER)
+_GUIDED_MODES = frozenset({"GUIDED"})
 _TEMPORARILY_REJECTED = object()  # sentinel returned by Drone._await_ack
+_EARTH_RADIUS = 6378137.0  # WGS-84 equatorial radius, metres
+_GOTO_ATTEMPTS = 3  # times a position target is sent before giving up on its echo
+_ECHO_WAIT = 1.0  # seconds to wait for POSITION_TARGET_GLOBAL_INT after each attempt
+_ECHO_LATLON_TOLERANCE = 20  # 1e-7 degree units (about 2 cm per unit)
+# SET_POSITION_TARGET_GLOBAL_INT: use the position only; let the autopilot pick yaw.
+_POSITION_ONLY_MASK = (
+    mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE
+    | mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE
+    | mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE
+    | mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
+    | mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
+    | mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+    | mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+    | mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+)
+_RELATIVE_FRAMES = frozenset(
+    {mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT}
+)
+_AMSL_FRAMES = frozenset({mavlink.MAV_FRAME_GLOBAL, mavlink.MAV_FRAME_GLOBAL_INT})
 
 # Messages flypi asks the vehicle to stream, with their rates in Hz.
 _STREAM_RATES = {
@@ -175,6 +196,7 @@ class Drone:
         self._command_locks: dict[int, threading.Lock] = {}
         self._status_messages: deque[tuple[float, str]] = deque(maxlen=100)
         self._statustext_chunks: dict[int, list[str]] = {}
+        self._position_target: tuple[float, Any] | None = None  # (received_at, message)
         self._thread_error: BaseException | None = None
         self._source_system: int = getattr(link, "source_system", 0) or 0
         self._source_component: int = getattr(link, "source_component", 0) or 0
@@ -416,6 +438,145 @@ class Drone:
                 "return to launch (vehicle to disarm)",
             )
 
+    def goto(
+        self,
+        lat: float,
+        lon: float,
+        altitude: float | None = None,
+        *,
+        groundspeed: float | None = None,
+        wait: bool = True,
+        tolerance: float = 1.0,
+        timeout: float = 120.0,
+    ) -> None:
+        """Fly to a global position and (by default) wait until the vehicle is there.
+
+        The vehicle must be armed and flying (see :meth:`takeoff`). flypi checks
+        that the autopilot actually took the new target, not just that the
+        message was sent:
+
+        * **ArduPilot**: switches to ``GUIDED`` if needed, sends
+          ``SET_POSITION_TARGET_GLOBAL_INT`` and then reads the target back
+          (``POSITION_TARGET_GLOBAL_INT``). MAVLink has no ACK for position
+          targets, so the read-back is the confirmation. A target that is lost
+          is resent; one the vehicle ignores raises :class:`~flypi.CommandRejected`.
+        * **PX4** (experimental): sends ``MAV_CMD_DO_REPOSITION``, which PX4
+          acknowledges, and flies it in Hold (``LOITER``) mode.
+
+        Args:
+            lat: Target latitude in degrees.
+            lon: Target longitude in degrees.
+            altitude: Target height above home in metres (the same reference as
+                :meth:`takeoff`). ``None`` keeps the current altitude.
+            groundspeed: Horizontal speed in m/s. On ArduPilot this is sent as
+                ``MAV_CMD_DO_CHANGE_SPEED`` and stays in effect for later moves.
+                ``None`` keeps the autopilot's current speed.
+            wait: Block until the vehicle is within ``tolerance`` of the target.
+            tolerance: Arrival radius in metres, applied horizontally and
+                vertically.
+            timeout: Seconds to wait for arrival when ``wait`` is ``True``.
+
+        Raises:
+            NotArmedError: if the vehicle is not armed.
+            ValueError: if a coordinate, altitude, speed or tolerance is invalid.
+            CommandRejected: if the vehicle refuses or ignores the target.
+            FlightInterrupted: (only with ``wait=True``) if the vehicle disarms or
+                leaves ``GUIDED`` (PX4: Hold) before arriving, for example
+                because of a failsafe or the RC pilot.
+        """
+        _check_lat_lon(lat, lon)
+        if altitude is not None and not math.isfinite(altitude):
+            raise ValueError(f"altitude must be a finite number of metres, got {altitude!r}")
+        if groundspeed is not None and not (math.isfinite(groundspeed) and groundspeed > 0):
+            raise ValueError(f"groundspeed must be a positive number of m/s, got {groundspeed!r}")
+        if not (math.isfinite(tolerance) and tolerance > 0):
+            raise ValueError(f"tolerance must be a positive number of metres, got {tolerance!r}")
+        if not self.armed:
+            raise NotArmedError(
+                "The vehicle must be armed and flying before goto(). "
+                "Call drone.arm() and drone.takeoff() first."
+            )
+        with self._cond:
+            alt_msl = self._position.get("alt_msl")
+            alt_rel = self._position.get("alt_rel")
+        if alt_msl is None or alt_rel is None:
+            raise FlypiError("No position yet; call drone.wait_ready() before goto().")
+        target_alt = alt_rel if altitude is None else altitude
+
+        hold_modes: frozenset[str]
+        if self._autopilot_id == mavlink.MAV_AUTOPILOT_PX4:
+            hold_modes = _PX4_GOTO_MODES
+            self._goto_px4(lat, lon, (alt_msl - alt_rel) + target_alt, groundspeed)
+            # The ACK can arrive before the heartbeat that shows the new mode.
+            self._wait(lambda: self._mode in hold_modes, 5.0, "PX4 to enter Hold (LOITER)")
+        else:
+            hold_modes = _GUIDED_MODES
+            self.set_mode("GUIDED")
+            if groundspeed is not None:
+                self._command_long(mavlink.MAV_CMD_DO_CHANGE_SPEED, (1, groundspeed, -1, 0))
+            self._goto_ardupilot(lat, lon, target_alt)
+
+        if wait:
+
+            def arrived() -> bool:
+                self._check_flight("goto", hold_modes)
+                cur_lat = self._position.get("lat")
+                cur_lon = self._position.get("lon")
+                cur_alt = self._position.get("alt_rel")
+                if cur_lat is None or cur_lon is None or cur_alt is None:
+                    return False
+                return (
+                    _distance_m(cur_lat, cur_lon, lat, lon) <= tolerance
+                    and abs(cur_alt - target_alt) <= tolerance
+                )
+
+            self._wait(
+                arrived,
+                timeout,
+                f"arrival at {lat:.7f}, {lon:.7f}, {target_alt:g} m (within {tolerance:g} m)",
+            )
+
+    def goto_relative(
+        self,
+        north: float = 0.0,
+        east: float = 0.0,
+        up: float = 0.0,
+        *,
+        groundspeed: float | None = None,
+        wait: bool = True,
+        tolerance: float = 1.0,
+        timeout: float = 120.0,
+    ) -> None:
+        """Fly a distance in metres from the current position.
+
+        Example::
+
+            drone.goto_relative(north=10, east=-5)   # 10 m north, 5 m west
+            drone.goto_relative(up=3)                # climb 3 m
+
+        Offsets are measured from where the vehicle is when you call this,
+        along true north and east. Everything else works as in :meth:`goto`.
+        """
+        for name, value in (("north", north), ("east", east), ("up", up)):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number of metres, got {value!r}")
+        with self._cond:
+            lat = self._position.get("lat")
+            lon = self._position.get("lon")
+            alt_rel = self._position.get("alt_rel")
+        if lat is None or lon is None or alt_rel is None:
+            raise FlypiError("No position yet; call drone.wait_ready() before goto_relative().")
+        target_lat, target_lon = _offset_position(lat, lon, north, east)
+        self.goto(
+            target_lat,
+            target_lon,
+            alt_rel + up,
+            groundspeed=groundspeed,
+            wait=wait,
+            tolerance=tolerance,
+            timeout=timeout,
+        )
+
     def wait_until(
         self,
         condition: Callable[[Telemetry], bool],
@@ -544,6 +705,116 @@ class Drone:
                 lambda mav: mav.request_data_stream_send(ts, tc, mavlink.MAV_DATA_STREAM_ALL, 4, 1)
             )
 
+    def _goto_ardupilot(self, lat: float, lon: float, alt_rel: float) -> None:
+        """Send a GUIDED position target and confirm it by reading it back."""
+        lat_i, lon_i = round(lat * 1e7), round(lon * 1e7)
+        ts, tc = self.target_system, self.target_component
+
+        def send(mav: Any) -> None:
+            mav.set_position_target_global_int_send(
+                0,
+                ts,
+                tc,
+                mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                _POSITION_ONLY_MASK,
+                lat_i,
+                lon_i,
+                alt_rel,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+
+        name = "SET_POSITION_TARGET_GLOBAL_INT"
+        sent_at = time.monotonic()
+        echo: Any = None
+        for attempt in range(_GOTO_ATTEMPTS):
+            attempt_at = time.monotonic()
+            self._send(send)
+            # Ask for the target straight away instead of waiting for a stream.
+            # ArduPilot answers FAILED while it has no position target; that is
+            # handled below like a missing echo.
+            with contextlib.suppress(CommandRejected):
+                self._command_long(
+                    mavlink.MAV_CMD_REQUEST_MESSAGE,
+                    (mavlink.MAVLINK_MSG_ID_POSITION_TARGET_GLOBAL_INT,),
+                    timeout=1.0,
+                    retries=1,
+                    explain=False,
+                )
+            echo = self._wait_for_position_target(attempt_at, _ECHO_WAIT)
+            if echo is not None and self._target_matches(echo, lat_i, lon_i, alt_rel):
+                return
+            log.debug("position target not confirmed (attempt %d); resending", attempt + 1)
+
+        with self._cond:
+            messages = [text for t, text in self._status_messages if t >= sent_at]
+        if echo is None:
+            detail = (
+                "The vehicle never reported a position target. ArduPilot only holds one "
+                "in GUIDED mode while flying: check the vehicle has taken off"
+            )
+        else:
+            detail = (
+                "The vehicle kept reporting a different target, so it ignored this one "
+                f"(it reports {echo.lat_int / 1e7:.7f}, {echo.lon_int / 1e7:.7f}, "
+                f"alt {echo.alt:g} m in frame {_enum_name('MAV_FRAME', echo.coordinate_frame)}). "
+                "Another program may be sending targets, or the target is outside a fence"
+            )
+        raise CommandRejected(name, "NOT_APPLIED", messages, detail=detail)
+
+    def _goto_px4(self, lat: float, lon: float, alt_msl: float, groundspeed: float | None) -> None:
+        nan = math.nan
+        self._command_int(
+            mavlink.MAV_CMD_DO_REPOSITION,
+            mavlink.MAV_FRAME_GLOBAL,
+            (
+                -1 if groundspeed is None else groundspeed,
+                mavlink.MAV_DO_REPOSITION_FLAGS_CHANGE_MODE,
+                0,
+                nan,  # yaw: let PX4 decide
+            ),
+            round(lat * 1e7),
+            round(lon * 1e7),
+            alt_msl,
+        )
+
+    def _wait_for_position_target(self, since: float, timeout: float) -> Any:
+        """Return the first POSITION_TARGET_GLOBAL_INT received after ``since``, or None."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                self._check_alive()
+                target = self._position_target
+                if target is not None and target[0] >= since:
+                    return target[1]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(min(remaining, 0.1))
+
+    def _target_matches(self, echo: Any, lat_i: int, lon_i: int, alt_rel: float) -> bool:
+        if abs(echo.lat_int - lat_i) > _ECHO_LATLON_TOLERANCE:
+            return False
+        if abs(echo.lon_int - lon_i) > _ECHO_LATLON_TOLERANCE:
+            return False
+        frame = echo.coordinate_frame
+        if frame in _RELATIVE_FRAMES:
+            return bool(abs(echo.alt - alt_rel) <= 0.5)
+        if frame in _AMSL_FRAMES:
+            with self._cond:
+                alt_msl = self._position.get("alt_msl")
+                rel = self._position.get("alt_rel")
+            if alt_msl is None or rel is None:
+                return True
+            return bool(abs(echo.alt - ((alt_msl - rel) + alt_rel)) <= 1.0)
+        return True  # terrain frames: only the horizontal position can be compared
+
     def _command_long(
         self,
         command: int,
@@ -564,9 +835,54 @@ class Drone:
         * Any other result: raise :class:`CommandRejected`, after giving the
           vehicle a moment to send the STATUSTEXT that explains why.
         """
-        name = _enum_name("MAV_CMD", command)
         padded = tuple(params) + (0,) * (7 - len(params))
         ts, tc = self.target_system, self.target_component
+
+        def make_send(confirmation: int) -> Callable[[Any], None]:
+            def send(mav: Any) -> None:
+                mav.command_long_send(ts, tc, command, confirmation, *padded)
+
+            return send
+
+        return self._command(command, make_send, timeout, retries, explain)
+
+    def _command_int(
+        self,
+        command: int,
+        frame: int,
+        params: tuple[float, float, float, float],
+        x: int,
+        y: int,
+        z: float,
+        *,
+        timeout: float = 3.0,
+        retries: int = 2,
+        explain: bool = True,
+    ) -> Any:
+        """Send COMMAND_INT (for commands carrying a lat/lon) and wait for its ACK.
+
+        Retries work as in :meth:`_command_long`; COMMAND_INT has no
+        ``confirmation`` counter, so resends are identical.
+        """
+        ts, tc = self.target_system, self.target_component
+
+        def make_send(confirmation: int) -> Callable[[Any], None]:
+            def send(mav: Any) -> None:
+                mav.command_int_send(ts, tc, frame, command, 0, 0, *params, x, y, z)
+
+            return send
+
+        return self._command(command, make_send, timeout, retries, explain)
+
+    def _command(
+        self,
+        command: int,
+        make_send: Callable[[int], Callable[[Any], None]],
+        timeout: float,
+        retries: int,
+        explain: bool,
+    ) -> Any:
+        name = _enum_name("MAV_CMD", command)
         with self._cond:
             lock = self._command_locks.setdefault(command, threading.Lock())
         # Two threads sending the same command would each see the other's ACK.
@@ -575,12 +891,7 @@ class Drone:
             for attempt in range(retries + 1):
                 with self._cond:
                     self._acks.pop(command, None)
-                confirmation = min(attempt, 255)
-
-                def send(mav: Any, confirmation: int = confirmation) -> None:
-                    mav.command_long_send(ts, tc, command, confirmation, *padded)
-
-                self._send(send)
+                self._send(make_send(min(attempt, 255)))
                 outcome = self._await_ack(command, name, timeout, sent_at, explain)
                 if outcome is not None and outcome is not _TEMPORARILY_REJECTED:
                     return outcome
@@ -686,9 +997,12 @@ class Drone:
                 self._explain(f"The vehicle disarmed during {phase}"), mode=self._mode
             )
         if hold_modes is not None and self._mode not in hold_modes:
+            # ArduPilot's takeoff also allows TAKEOFF (Plane), but GUIDED is the mode
+            # the user asked for, so name that one.
+            expected = "GUIDED" if "GUIDED" in hold_modes else "/".join(sorted(hold_modes))
             raise FlightInterrupted(
                 self._explain(
-                    f"{phase.capitalize()} interrupted: the vehicle switched from GUIDED "
+                    f"{phase.capitalize()} interrupted: the vehicle switched from {expected} "
                     f"to {self._mode} (a failsafe, the RC pilot or another ground station)"
                 ),
                 mode=self._mode,
@@ -825,6 +1139,8 @@ class Drone:
             )
         elif mtype == "STATUSTEXT":
             self._handle_statustext(msg)
+        elif mtype == "POSITION_TARGET_GLOBAL_INT":
+            self._position_target = (time.monotonic(), msg)
         elif mtype == "COMMAND_ACK" and self._ack_is_for_us(msg):
             self._acks[msg.command] = msg
 
@@ -903,6 +1219,29 @@ def _wait_for_vehicle(
             continue
         if target_system is None or msg.get_srcSystem() == target_system:
             return msg
+
+
+def _check_lat_lon(lat: float, lon: float) -> None:
+    if not (math.isfinite(lat) and -90.0 <= lat <= 90.0):
+        raise ValueError(f"lat must be between -90 and 90 degrees, got {lat!r}")
+    if not (math.isfinite(lon) and -180.0 <= lon <= 180.0):
+        raise ValueError(f"lon must be between -180 and 180 degrees, got {lon!r}")
+
+
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle (haversine) distance between two points, in metres."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * _EARTH_RADIUS * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _offset_position(lat: float, lon: float, north: float, east: float) -> tuple[float, float]:
+    """The point ``north``/``east`` metres from ``lat``/``lon`` (flat-earth, fine below ~10 km)."""
+    new_lat = lat + math.degrees(north / _EARTH_RADIUS)
+    new_lon = lon + math.degrees(east / (_EARTH_RADIUS * math.cos(math.radians(lat))))
+    new_lon = (new_lon + 180.0) % 360.0 - 180.0
+    return new_lat, new_lon
 
 
 def _dedupe(items: list[str]) -> list[str]:
