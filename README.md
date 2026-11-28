@@ -1,4 +1,4 @@
-# flypi
+3# flypi
 
 **Fly ArduPilot and PX4 drones from a Raspberry Pi with a few lines of Python.**
 
@@ -6,6 +6,9 @@
 [![PyPI](https://img.shields.io/pypi/v/flypi.svg)](https://pypi.org/project/flypi/)
 [![Python](https://img.shields.io/pypi/pyversions/flypi.svg)](https://pypi.org/project/flypi/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.1234567.svg)](https://doi.org/10.5281/zenodo.24578430)
+📄 **Paper:** [flypi: Confirmed-Command Control of MAVLink Drones from Python Companion Computers, and Three Pitfalls Found by Fault Injection](https://doi.org/10.5281/zenodo.24578430)
 
 flypi is a small, modern, high-level MAVLink library for companion computers.
 It is built on [pymavlink](https://github.com/ArduPilot/pymavlink), has no other
