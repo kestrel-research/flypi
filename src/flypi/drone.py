@@ -25,6 +25,8 @@ from typing import Any
 from pymavlink import mavutil
 
 from . import modes as _modes
+from ._geo import EARTH_RADIUS as _EARTH_RADIUS
+from ._geo import distance_m as _distance_m
 from .errors import (
     CommandRejected,
     CommandTimeout,
@@ -62,7 +64,6 @@ _RTL_MODES = frozenset({"RTL", "LAND", "QRTL", "QLAND", "SMART_RTL"})
 _PX4_GOTO_MODES = frozenset({"LOITER"})  # PX4 flies DO_REPOSITION in Hold (AUTO.LOITER)
 _GUIDED_MODES = frozenset({"GUIDED"})
 _TEMPORARILY_REJECTED = object()  # sentinel returned by Drone._await_ack
-_EARTH_RADIUS = 6378137.0  # WGS-84 equatorial radius, metres
 _GOTO_ATTEMPTS = 3  # times a position target is sent before giving up on its echo
 _ECHO_WAIT = 1.0  # seconds to wait for POSITION_TARGET_GLOBAL_INT after each attempt
 _ECHO_LATLON_TOLERANCE = 20  # 1e-7 degree units (about 2 cm per unit)
@@ -1226,14 +1227,6 @@ def _check_lat_lon(lat: float, lon: float) -> None:
         raise ValueError(f"lat must be between -90 and 90 degrees, got {lat!r}")
     if not (math.isfinite(lon) and -180.0 <= lon <= 180.0):
         raise ValueError(f"lon must be between -180 and 180 degrees, got {lon!r}")
-
-
-def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle (haversine) distance between two points, in metres."""
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = p2 - p1, math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * _EARTH_RADIUS * math.asin(min(1.0, math.sqrt(a)))
 
 
 def _offset_position(lat: float, lon: float, north: float, east: float) -> tuple[float, float]:
