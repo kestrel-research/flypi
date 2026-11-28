@@ -4,6 +4,13 @@ All notable changes to flypi are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and flypi uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `Position.distance_to(lat, lon)`: horizontal distance in metres from a position to a point,
+  or `None` if the position has no `lat`/`lon` yet. The haversine helper now lives in
+  `flypi._geo` and is shared with `Drone.goto()`.
+
 ## [0.2.0] - 2026-11-28
 
 ### Added
