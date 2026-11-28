@@ -29,11 +29,20 @@ class CommandRejected(FlypiError):
             usually explain why (for example ArduPilot ``PreArm:`` messages).
     """
 
-    def __init__(self, command: str, result: str, status_messages: list[str] | None = None):
+    def __init__(
+        self,
+        command: str,
+        result: str,
+        status_messages: list[str] | None = None,
+        *,
+        detail: str | None = None,
+    ):
         self.command = command
         self.result = result
         self.status_messages = list(status_messages or [])
         message = f"{command} was rejected by the vehicle ({result})"
+        if detail:
+            message += f". {detail}"
         if self.status_messages:
             message += ". Recent vehicle messages: " + " | ".join(self.status_messages)
         super().__init__(message)

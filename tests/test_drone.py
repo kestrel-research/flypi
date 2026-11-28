@@ -10,7 +10,7 @@ import flypi
 
 
 def test_version_is_exposed():
-    assert flypi.__version__ == "0.1.1"
+    assert flypi.__version__ == "0.2.0"
 
 
 def test_connect_and_read_telemetry(fly):

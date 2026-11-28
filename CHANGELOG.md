@@ -4,6 +4,25 @@ All notable changes to flypi are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and flypi uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-11-28
+
+### Added
+- `Drone.goto(lat, lon, altitude=None, *, groundspeed=None, wait=True, tolerance=1.0,
+  timeout=120.0)`: fly to a global position (altitude above home) and wait until the
+  vehicle is within `tolerance` metres.
+  - ArduPilot: switches to `GUIDED`, sends `SET_POSITION_TARGET_GLOBAL_INT`, then
+    confirms the target by reading it back with `MAV_CMD_REQUEST_MESSAGE`
+    (`POSITION_TARGET_GLOBAL_INT`). Lost targets are resent; an ignored target raises
+    `CommandRejected` with result `NOT_APPLIED` and an explanation.
+  - PX4 (experimental): uses the acknowledged `MAV_CMD_DO_REPOSITION` (`COMMAND_INT`).
+  - `groundspeed` is sent as `MAV_CMD_DO_CHANGE_SPEED` on ArduPilot (and stays in
+    effect) or as the reposition speed on PX4.
+  - Raises `FlightInterrupted` if the vehicle disarms or changes mode before arriving.
+- `Drone.goto_relative(north=0, east=0, up=0, ...)`: fly a distance in metres from
+  the current position.
+- `CommandRejected` takes an optional keyword-only `detail`, appended to the message.
+- `examples/goto.py`.
+
 ## [0.1.1] - 2026-11-26
 
 Reliability release. No breaking changes: everything that worked in 0.1.0 works the
@@ -52,5 +71,6 @@ same way, and a few failure cases now raise clearer errors sooner.
   the autopilot's own `PreArm:` messages).
 - ArduPilot support, plus experimental PX4 support.
 
+[0.2.0]: https://github.com/kestrel-research/flypi/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/kestrel-research/flypi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/kestrel-research/flypi/releases/tag/v0.1.0
